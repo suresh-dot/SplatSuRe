@@ -14,9 +14,9 @@
 
 set -e
 
-REPO="/home/suresh/Documents/SplatSuRe"
-DATASET="/home/suresh/Documents/SR/HAT"
-OUTPUT="/home/suresh/Documents/OUTPUTS/Splatsure_v1"
+REPO="/home/suresh/3dgs/SplatSuRe"
+DATASET="/home/suresh/3dgs/DATA"
+OUTPUT="/home/suresh/3dgs/OUTPUTS/Splatsure_v1"
 PRED="$OUTPUT/submissions"
 
 cd "$REPO"
