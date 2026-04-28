@@ -8,15 +8,11 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-import copy
-import numpy as np
-import torch.nn.functional as F
-import torchvision.transforms as T
-from transformers import AutoModelForDepthEstimation
+
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import ssim, weighted_ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -26,11 +22,15 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from torchvision.utils import save_image
+import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+TENSORBOARD_FOUND = False
+from PIL import Image
 
 try:
     from fused_ssim import fused_ssim
@@ -44,38 +44,9 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def pearson_corr_loss(pred_depth, mono_depth):
-    # Flatten and normalize
-    pred_depth = pred_depth.flatten()
-    mono_depth = mono_depth.flatten()
-    pred_depth = (pred_depth - pred_depth.mean()) / (pred_depth.std() + 1e-6)
-    mono_depth = (mono_depth - mono_depth.mean()) / (mono_depth.std() + 1e-6)
-    # 1.0 - mean(a * b) minimizes to 0 when perfectly positively correlated
-    return 1.0 - (pred_depth * mono_depth).mean()
-
-def interpolate_pseudo_camera(cam_a, cam_b, t):
-    from utils.graphics_utils import getWorld2View2
-    # SLERP Rotation via SVD
-    R_lerp = (1 - t) * cam_a.R + t * cam_b.R
-    U, _, Vt = np.linalg.svd(R_lerp)
-    R = U @ Vt
-    if np.linalg.det(R) < 0:
-        Vt[-1] *= -1
-        R = U @ Vt
-    # LERP Translation
-    T = (1 - t) * cam_a.T + t * cam_b.T
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, upscale):
+    background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     
-    # Clone camera properties safely
-    p = copy.copy(cam_a)
-    p.R = R
-    p.T = T
-    p.world_view_transform = torch.tensor(getWorld2View2(R, T, cam_a.trans, cam_a.scale)).transpose(0, 1).cuda()
-    p.full_proj_transform = (p.world_view_transform.unsqueeze(0).bmm(cam_a.projection_matrix.unsqueeze(0))).squeeze(0)
-    p.camera_center = p.world_view_transform.inverse()[3, :3]
-    return p
-
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
-
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
@@ -83,23 +54,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
-    # ── Pure GPU DA-V2 Initialization ──
-    da_v2_model = None
-    normalize_transform = None
-    if args.pseudo_view_weight > 0:
-        model_id = f"depth-anything/Depth-Anything-V2-{args.pseudo_view_model_size.capitalize()}-hf"
-        print(f"[FSGS] Loading {model_id} for Pseudo-View Regularization...")
-        da_v2_model = AutoModelForDepthEstimation.from_pretrained(model_id).to("cuda").eval()
-        for p in da_v2_model.parameters(): 
-            p.requires_grad_(False)
-        # Standard ImageNet normalization required by DA-V2 Transformers
-        normalize_transform = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-    train_cams_sorted = sorted(scene.getTrainCameras(), key=lambda c: c.image_name)
-
+    if args.render_debug:
+        os.makedirs(os.path.join(scene.model_path, 'renders'), exist_ok=True)
     gaussians.training_setup(opt)
+    # Load LR images
+    for cam in scene.getTrainCameras():
+        H, W = cam.image_height, cam.image_width
+        h_lr, w_lr = round(H/upscale), round(W/upscale)
+        lr_img_ext = os.listdir(f"{dataset.source_path}/images/")[0].split('.')[-1]
+        image_name = cam.image_name
+        image_name = ''.join(image_name.split('.')[:-1]) + f'.{lr_img_ext}'
+        lr_image = Image.open(f"{dataset.source_path}/images/" + image_name).resize((w_lr, h_lr))
+        lr_image = torch.from_numpy(np.array(lr_image)).permute(2, 0, 1) / 255.0
+        cam.lr = lr_image
+            
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -110,6 +80,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+
+    # Load weight maps
+    for cam in scene.getTrainCameras():
+        if args.weight_maps_path is not None:
+            sr_weight_map_lr = torch.load(os.path.join(args.weight_maps_path, "SR_" + cam.image_name + ".pty")).cuda()
+            cam.sr_weight_map = torch.nn.functional.interpolate(sr_weight_map_lr.unsqueeze(0).unsqueeze(0), (cam.image_height, cam.image_width))[0][0]
+        else:
+            if args.no_sr:
+                print("Using SR of all zeros")
+                cam.sr_weight_map = torch.zeros((cam.image_height, cam.image_width), device="cuda")
+            elif args.full_sr:
+                print("Using SR of all ones")
+                cam.sr_weight_map = torch.ones((cam.image_height, cam.image_width), device="cuda")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -164,12 +147,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image *= alpha_mask
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+        gt_sr = viewpoint_cam.original_image.cuda()
+        lr_h, lr_w = viewpoint_cam.lr.shape[1:]
+        render_lr = torch.nn.functional.interpolate(image.unsqueeze(0), (lr_h, lr_w), mode='bicubic', antialias=True, align_corners=False).squeeze(0)
+
+        Ll1_sr = (torch.abs((image - gt_sr))*viewpoint_cam.sr_weight_map.unsqueeze(0)).mean()
+        Ll1_lr = (torch.abs(render_lr - viewpoint_cam.lr.cuda())).mean() # Use full LR image
+        Ll1 = args.gamma*Ll1_sr + (1-args.gamma)*Ll1_lr
+        
+        ssim_val_sr = weighted_ssim(image, gt_sr, viewpoint_cam.sr_weight_map)
+        ssim_val_lr = ssim(render_lr, viewpoint_cam.lr.cuda()) # Use full LR image
+        ssim_value = args.gamma*ssim_val_sr + (1-args.gamma)*ssim_val_lr
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -187,57 +175,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # ===================================================================
-        # FSGS: Pseudo-View Depth Regularization 
-        # ===================================================================
-        if (da_v2_model is not None 
-            and args.pseudo_view_start < iteration < args.pseudo_view_end # Corrected bounds
-            and iteration % args.pseudo_view_interval == 0):
-            
-            # 1. Sample interpolation
-            i = randint(0, len(train_cams_sorted) - 2)
-            t = 0.3 + 0.4 * torch.rand(1).item() # Keep it between 0.3 and 0.7
-            p_cam = interpolate_pseudo_camera(train_cams_sorted[i], train_cams_sorted[i + 1], t)
-            
-            # 2. Render Virtual View
-            p_pkg = render(p_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-            rgb_p = p_pkg["render"].clamp(0, 1)
-            
-            # 3. Pure-GPU DA-V2 Inference
-            with torch.no_grad():
-                H, W = rgb_p.shape[1:]
-                rgb_resized = F.interpolate(rgb_p.unsqueeze(0), size=(518, 518), mode='bilinear', align_corners=False)
-                da_input = normalize_transform(rgb_resized)
-                
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    mono_inv_p_518 = da_v2_model(da_input).predicted_depth # [1, 518, 518]
-                mono_inv_p = F.interpolate(mono_inv_p_518.unsqueeze(1).float(), size=(H, W), mode='bilinear', align_corners=False).squeeze()
-            
-            # 4. Pearson Correlation Loss
-            # FIXED: Both p_pkg["depth"] and mono_inv_p are inverse depth. Do not invert.
-            inv_d_p = p_pkg["depth"].squeeze() 
-            loss_pseudo = args.pseudo_view_weight * pearson_corr_loss(inv_d_p, mono_inv_p)
-            loss += loss_pseudo
-        # ===================================================================
-
-
         loss.backward()
 
         iter_end.record()
 
         with torch.no_grad():
+            if iteration % 1000 == 0 and args.render_debug:
+                save_image([image.cpu(), viewpoint_cam.sr_weight_map.cpu().unsqueeze(0).repeat(3, 1, 1), gt_sr.cpu()], os.path.join(scene.model_path, 'renders', f'iter_{iteration}.jpg'))
+                save_image([render_lr.cpu(), viewpoint_cam.lr.cpu()], os.path.join(scene.model_path, 'renders', f'iter_{iteration}_lr.jpg'))
+                print(f"Iteration {iteration}")
+                print(f"Image: {viewpoint_cam.image_name}")
+                print("Loss: LR L1 {}, SR L1 {}, LR SSIM {}, SR SSIM {}".format(Ll1_lr.item(), Ll1_sr.item(), ssim_val_lr.item(), ssim_val_sr.item()))
+                print(f"Iteration {iteration} == Total Loss: {Ll1} + {ssim_value} => {loss}")
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            if iteration % 100 == 0:
+            if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
-                progress_bar.update(100)
+                progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            # Save model
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -293,45 +253,6 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
-
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -350,13 +271,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--img_ext", type=str, default = None)
-    ## 
-# In train_lr.py __main__ argument parser:
-    parser.add_argument("--pseudo_view_weight", type=float, default=0.0)
-    parser.add_argument("--pseudo_view_interval", type=int, default=10)
-    parser.add_argument("--pseudo_view_start", type=int, default=2000)
-    parser.add_argument("--pseudo_view_end", type=int, default=10000) # ADD THIS LINE
-    parser.add_argument("--pseudo_view_model_size", type=str, default="small", choices=["small", "base", "large"])
+    parser.add_argument("--weight_maps_path", type=str, default = None)
+    parser.add_argument("--gamma", type=float, default = 0.4)
+    parser.add_argument("--render_debug", action='store_true', default=False)
+    parser.add_argument("--upscale", type=int, default = 4)
+    parser.add_argument("--no_sr", action='store_true', default=False)
+    parser.add_argument("--full_sr", action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -371,7 +291,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     dataset = lp.extract(args)
     dataset.img_ext = args.img_ext
-   #training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
-    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
+    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.upscale)
+
     # All done
     print("\nTraining complete.")
