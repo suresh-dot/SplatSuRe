@@ -8,6 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import math
 import copy
 import numpy as np
 import torch.nn.functional as F
@@ -26,6 +27,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+try:
+    from gsplat import rasterization
+    GSPLAT_AVAILABLE = True
+except ImportError:
+    GSPLAT_AVAILABLE = False
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -155,9 +161,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
+        if not GSPLAT_AVAILABLE:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        else:
+            # 1. Extract standard K matrix from FoV
+            fx = (viewpoint_cam.image_width / 2) / math.tan(viewpoint_cam.FoVx / 2.)
+            fy = (viewpoint_cam.image_height / 2) / math.tan(viewpoint_cam.FoVy / 2.)
+            K = torch.tensor([[fx, 0, viewpoint_cam.image_width/2],
+                            [0, fy, viewpoint_cam.image_height/2],
+                            [0,  0, 1]], device="cuda", dtype=torch.float32).unsqueeze(0)
+            
+            # 2. Extract View Matrix (World to Camera)
+            viewmat = viewpoint_cam.world_view_transform.transpose(0, 1).unsqueeze(0)
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            # 3. Call gsplat (using RGB+ED to get Expected Depth for your loss later)
+            colors, alphas, meta = rasterization(
+                means=gaussians.get_xyz,
+                quats=gaussians.get_rotation,
+                scales=gaussians.get_scaling,
+                opacities=gaussians.get_opacity,
+                shs=gaussians.get_features,
+                viewmats=viewmat,
+                Ks=K,
+                width=viewpoint_cam.image_width,
+                height=viewpoint_cam.image_height,
+                sh_degree=gaussians.active_sh_degree,
+                render_mode="RGB+ED", # Gets RGB + Expected Depth
+                backgrounds=bg.unsqueeze(0)
+            )
+            
+            # 4. Map outputs back to your variables
+            # gsplat returns [Batch, Height, Width, Channels], PyTorch needs [C, H, W]
+            image = colors[0, :, :, :3].permute(2, 0, 1) 
+            invDepth = colors[0, :, :, 3].unsqueeze(0) # Extract Depth map for your depth_l1_weight logic
+            
+            radii = meta["radii"].squeeze(0)
+            visibility_filter = radii > 0
+            viewspace_point_tensor = meta["means2d"].squeeze(0)
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -176,7 +217,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
+            if not GSPLAT_AVAILABLE: 
+                invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
@@ -301,7 +343,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
     # Report test and samples of training set
     if iteration in testing_iterations:
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
@@ -331,7 +373,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # Set up command line argument parser
