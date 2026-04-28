@@ -440,6 +440,19 @@ def rename_renders_to_test_filenames(
     return scene_pred_dir
 
 
+def evaluate_metrics(
+    repo_root: Path,
+    model_path: Path,
+    log_file: Path | None = None,
+) -> None:
+    """Run the evaluation metrics script on the output model."""
+    cmd = [
+        sys.executable, str(repo_root / "metrics.py"),
+        "-m", str(model_path)
+    ]
+    run_cmd(cmd, cwd=repo_root, log_file=log_file)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
@@ -698,6 +711,14 @@ def main() -> int:
                 test_images=test_imgs,
                 pred_root=pred_root,
                 scene_name=scene_name,
+            )
+
+            # ── Evaluate Metrics ───────────────────────────────────────────────
+            print(f"\n[Metrics] Evaluating on generated renders ...")
+            evaluate_metrics(
+                repo_root=repo_root,
+                model_path=sr_out,
+                log_file=log_file,
             )
 
             # ── Export point cloud ─────────────────────────────────────────────
