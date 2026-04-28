@@ -77,7 +77,8 @@ def evaluate(model_paths):
                 print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
                 print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
                 print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
-                print("")
+                print("-"*50)
+                print(f"Final Score: {torch.tensor(ssims).mean()/2 + torch.tensor(psnrs).mean()/60:.5f}")
 
                 # Handle variable image sizes in dataset 
                 sizes = list(set([(r.shape[-2], r.shape[-1]) for r in renders]))
