@@ -209,7 +209,7 @@ def ensure_images_SR_symlink(scene_dir: Path, sr_folder_name: str) -> Path:
     Returns the Path to images_SR/.
     """
     src = scene_dir / sr_folder_name   # what you have, e.g. images_sr/
-    dst = scene_dir / "images_4x"      # what SplatSuRe expects
+    dst = scene_dir / "images_sr"      # what SplatSuRe expects
 
     if not src.exists():
         raise FileNotFoundError(
@@ -359,7 +359,7 @@ def train_sr_phase(
         "-m", str(sr_out),
         "-r", "1",            # SR images are already at target resolution
         "--eval",
-        "--images",           "images_4x",
+        "--images",           "images_sr",
         "--img_ext",          img_ext,
         "--upscale",          str(upscale),
         "--weight_maps_path", str(weight_maps_path),
@@ -400,7 +400,7 @@ def render_predictions(
         "--model_path", str(scene_out),
         "--iteration",  str(iteration),
         "-s",           str(scene_dir),
-        "--images",     "images_4x",
+        "--images",     "images_sr",
         "--img_ext",    img_ext,
         "--upscale",    "1",
         "--skip_train",
@@ -493,7 +493,7 @@ def main() -> int:
     parser.add_argument("--ratio-threshold", type=float, default=1.1,
                         help="Ratio threshold for weight_maps.py (Section 4.1 of paper). "
                              "Controls how aggressively SR maps are applied. Default: 1.1")
-    parser.add_argument("--sr-folder", type=str, default="images_4x",
+    parser.add_argument("--sr-folder", type=str, default="images_sr",
                         help="Name of your SR folder inside each scene dir")
     parser.add_argument("--ext-override", type=str, default=None,
                         help="Force one extension for ALL scenes (no dot, e.g. 'jpg'). "
