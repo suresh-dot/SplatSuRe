@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+from fused_ssim import fused_ssim
+from fused_ssim_cuda import fusedssim
 try:
     from diff_gaussian_rasterization._C import fusedssim, fusedssim_backward
 except:

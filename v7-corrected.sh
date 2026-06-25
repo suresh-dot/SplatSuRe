@@ -16,33 +16,33 @@ set -e
 
 REPO="/home/suresh/Documents/SplatSuRe"
 DATASET="/home/suresh/Documents/SR/HAT_REALx4"
-OUTPUT="/home/suresh/Documents/OUTPUTS/Splatsure_v2"
+OUTPUT="/home/suresh/Documents/OUTPUTS/Splatsure_v3"
 PRED="$OUTPUT/submissions"
 
 cd "$REPO"
 
 #── PASS 1A: Thin + reliable depth (aeroplane, toy) ──────────────────────────
 #Active depth signal (ρ=0.855/0.911) + Universal MVS Init
-# python train_splatsure_competition.py \
-#   --repo-root    "$REPO" \
-#   --dataset-root "$DATASET" \
-#   --output-root  "$OUTPUT" \
-#   --pred-root    "$PRED" \
-#   --scenes aeroplane \
-#   --lr-iterations  15000 \
-#   --sr-iterations  50000 \
-#   --ratio-threshold 1.1 \
-#   --upscale 4 \
-#   --extra-train-args "--opacity_reset_interval 3000 --densify_grad_threshold 0.00015" \
-#   --extra-lr-args "--pseudo_view_weight 0.03 \
-#                  --pseudo_view_interval 10 \
-#                  --pseudo_view_start 1000 \
-#                  --pseudo_view_end 8000 \
-#                  --pseudo_view_model_size small \
-#                  --densify_until_iter 10000 \
-#                  --position_lr_max_steps 15000" \
-#   --extra-sr-args "--gamma 0.4 \
-#                  --position_lr_max_steps 50000"
+python train_splatsure_competition.py \
+  --repo-root    "$REPO" \
+  --dataset-root "$DATASET" \
+  --output-root  "$OUTPUT" \
+  --pred-root    "$PRED" \
+  --scenes aeroplane \
+  --lr-iterations  15000 \
+  --sr-iterations  50000 \
+  --ratio-threshold 1.1 \
+  --upscale 4 \
+  --extra-train-args "--opacity_reset_interval 3000 --densify_grad_threshold 0.00015" \
+  --extra-lr-args "--pseudo_view_weight 0.03 \
+                 --pseudo_view_interval 10 \
+                 --pseudo_view_start 1000 \
+                 --pseudo_view_end 8000 \
+                 --pseudo_view_model_size small \
+                 --densify_until_iter 10000 \
+                 --position_lr_max_steps 15000" \
+  --extra-sr-args "--gamma 0.4 \
+                 --position_lr_max_steps 50000"
 
 # ── PASS 2B: Smooth + no depth (face, still3) ────────────────────────────────
 # Depth Loss ZERO + Universal MVS Init + Conservative ratio
