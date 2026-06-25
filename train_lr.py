@@ -27,14 +27,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-try:
-    use_GSPLAT = False
-    GSPLAT_AVAILABLE = use_GSPLAT
-    if use_GSPLAT:
-        from gsplat import rasterization
-        GSPLAT_AVAILABLE = True
-except ImportError:
-    GSPLAT_AVAILABLE = False
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -164,11 +157,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        if not GSPLAT_AVAILABLE:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        else:
-            from gaussian_renderer.gsplat_renderer import render_gsplat
-            render_pkg = render_gsplat(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
