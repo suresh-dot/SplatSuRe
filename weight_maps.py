@@ -23,12 +23,23 @@ parser.add_argument("--weight_maps_dirname", type=str, default = "weight_maps")
 parser.add_argument("--ratio_threshold", type=float, default = 1.7)
 parser.add_argument("--render_debug", action="store_true", default=False)
 
-#dummy args:
+#dummy args (accepted for compatibility with train_lr.py / run-all.sh):
+parser.add_argument('--ip', type=str, default="127.0.0.1")
+parser.add_argument('--port', type=int, default=6009)
+parser.add_argument('--debug_from', type=int, default=-1)
+parser.add_argument('--detect_anomaly', action='store_true', default=False)
+parser.add_argument('--disable_viewer', action='store_true', default=False)
+parser.add_argument("--start_checkpoint", type=str, default = None)
+parser.add_argument("--img_ext", type=str, default = None)
 parser.add_argument("--pseudo_view_weight", type=float, default=0.0)
 parser.add_argument("--pseudo_view_interval", type=int, default=10)
 parser.add_argument("--pseudo_view_start", type=int, default=2000)
 parser.add_argument("--pseudo_view_end", type=int, default=10000) # ADD THIS LINE
 parser.add_argument("--pseudo_view_model_size", type=str, default="small", choices=["small", "base", "large"])
+parser.add_argument("--pseudo_view_model_path", type=str, default=None,
+                    help="Local Hugging Face snapshot directory for pseudo-view DA-V2")
+parser.add_argument("--pseudo_view_allow_download", action="store_true",
+                    help="Allow downloading missing pseudo-view model files; default is local cache only")
 
 args = parser.parse_args(sys.argv[1:])
 

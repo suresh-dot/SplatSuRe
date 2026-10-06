@@ -218,7 +218,7 @@ import shutil
 from pathlib import Path
 from PIL import Image
 
-DATASET_ROOT = Path("/home/suresh/Documents/dataset")
+DATASET_ROOT = Path("/home/suresh/3dgs/HAT_REALx4")
 
 def get_camera_width(sparse_dir):
     """Reads the exact width expected by COLMAP from cameras.bin or cameras.txt"""

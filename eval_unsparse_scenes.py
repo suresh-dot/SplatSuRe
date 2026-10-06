@@ -247,8 +247,7 @@ def main():
     print(f"  Total images          : {len(all_rows)}")
     print(f"  Image-mean PSNR       : {psnrs.mean():.3f}")
     print(f"  Image-mean SSIM       : {ssims.mean():.4f}")
-    print(f"  Image-mean SCORE      : {scores.mean():.4f}    "
-          f"<-- proxy for leaderboard contribution from these 4 scenes")
+    print(f"  Image-mean SCORE      : {scores.mean():.4f}")
     macro_score = float(np.mean([s["score_mean"] for s in summaries if s["n"] > 0]))
     print(f"  Scene-macro SCORE     : {macro_score:.4f}    "
           f"(unweighted mean over scenes — useful when scene sizes differ)")

@@ -22,7 +22,11 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
 
     if cam_info.depth_path != "":
         try:
-            if is_nerf_synthetic:
+            if cam_info.depth_path.endswith(".npy"):
+                # Real float depth stored as .npy — already in the correct scale
+                # for depth_params (scale/offset) to be applied; do NOT divide.
+                invdepthmap = np.load(cam_info.depth_path).astype(np.float32)
+            elif is_nerf_synthetic:
                 invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / 512
             else:
                 invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)

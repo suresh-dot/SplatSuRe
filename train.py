@@ -36,7 +36,7 @@ TENSORBOARD_FOUND = False
 from PIL import Image
 
 try:
-    from fused_ssim import fused_ssim
+    from fused_ssim import fused_ssim3d, fused_ssim
     FUSED_SSIM_AVAILABLE = True
 except:
     FUSED_SSIM_AVAILABLE = False
@@ -57,7 +57,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
-
     # ===================================================================
     # FLOAT32 DEPTH INJECTION - LOAD CACHE
     # ===================================================================
@@ -139,7 +138,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    progress_bar = tqdm(range(first_iter, opt.iterations), leave=False , desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -190,15 +189,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_sr = viewpoint_cam.original_image.cuda()
         lr_h, lr_w = viewpoint_cam.lr.shape[1:]
         render_lr = torch.nn.functional.interpolate(image.unsqueeze(0), (lr_h, lr_w), mode='area').squeeze(0)
-
+        # print(f"shape gt_sr: {gt_sr.shape}, shape render_lr: {render_lr.shape}, shape viewpoint_cam.lr: {viewpoint_cam.lr.shape}", file=sys.stderr)
+        # break
         Ll1_sr = (torch.abs((image - gt_sr))*viewpoint_cam.sr_weight_map.unsqueeze(0)).mean()
         Ll1_lr = (torch.abs(render_lr - viewpoint_cam.lr.cuda())).mean() # Use full LR image
         Ll1 = args.gamma*Ll1_sr + (1-args.gamma)*Ll1_lr
         
         ssim_val_sr = weighted_ssim(image, gt_sr, viewpoint_cam.sr_weight_map)
+        # print(f"SSIM SR: {ssim_val_sr.item():.4f}", end=", ", file=sys.stderr)
+        # ssim_val_lr = fused_ssim(render_lr.unsqueeze(0), viewpoint_cam.lr.cuda().unsqueeze(0)) # Use full LR image
         ssim_val_lr = ssim(render_lr, viewpoint_cam.lr.cuda()) # Use full LR image
-        ssim_value = args.gamma*ssim_val_sr + (1-args.gamma)*ssim_val_lr
 
+        ssim_value = args.gamma*ssim_val_sr + (1-args.gamma)*ssim_val_lr
+        # ssim_value = ssim_val_sr
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
@@ -248,10 +251,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 1000 == 0 and args.render_debug:
                 save_image([image.cpu(), viewpoint_cam.sr_weight_map.cpu().unsqueeze(0).repeat(3, 1, 1), gt_sr.cpu()], os.path.join(scene.model_path, 'renders', f'iter_{iteration}.jpg'))
                 save_image([render_lr.cpu(), viewpoint_cam.lr.cpu()], os.path.join(scene.model_path, 'renders', f'iter_{iteration}_lr.jpg'))
-                print(f"Iteration {iteration}")
-                print(f"Image: {viewpoint_cam.image_name}")
-                print("Loss: LR L1 {}, SR L1 {}, LR SSIM {}, SR SSIM {}".format(Ll1_lr.item(), Ll1_sr.item(), ssim_val_lr.item(), ssim_val_sr.item()))
-                print(f"Iteration {iteration} == Total Loss: {Ll1} + {ssim_value} => {loss}")
+                # print(f"Iteration {iteration}")
+                # print(f"Image: {viewpoint_cam.image_name}")
+                # print("Loss: LR L1 {}, SR L1 {}, LR SSIM {}, SR SSIM {}".format(Ll1_lr.item(), Ll1_sr.item(), ssim_val_lr.item(), ssim_val_sr.item()))
+                # print(f"Iteration {iteration} == Total Loss: {Ll1} + {ssim_value} => {loss}")
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
@@ -264,7 +267,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Save model
             if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                # print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
@@ -278,7 +281,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     # Gate the pruning threshold based on whether depth supervision is active for this scene
                     # prune_opacity = 0.005 if opt.depth_l1_weight_init > 0 else 0.05
                     # Remove the conditional entirely
-                    prune_opacity = 0.005
+                    prune_opacity = 0.01
                     gaussians.densify_and_prune(opt.densify_grad_threshold, prune_opacity, scene.cameras_extent, size_threshold, radii)
                     #aussians.densify_and_prune(opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold, radii)
                 
@@ -298,7 +301,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                # print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
@@ -319,8 +322,8 @@ def prepare_output_and_logger(args):
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
+    # else:
+        # print("Tensorboard not available: not logging progress")
     return tb_writer
 
 
@@ -349,6 +352,7 @@ if __name__ == "__main__":
     parser.add_argument("--full_sr", action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    
     
     print("Optimizing " + args.model_path)
 

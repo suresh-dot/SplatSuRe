@@ -147,15 +147,15 @@ def run_cmd(cmd: list[str], cwd: Path, log_file: Path | None = None) -> None:
 
     proc = subprocess.Popen(
         cmd, cwd=str(cwd),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        # stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
     )
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        sys.stdout.write(line)
-        if log_file:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(line)
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            if log_file:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
     rc = proc.wait()
     if rc != 0:
         raise subprocess.CalledProcessError(rc, cmd)
@@ -258,6 +258,7 @@ def train_lr_phase(
     white_bg: bool,
     extra_train_args: list[str],
     log_file: Path,
+    quiet :bool
 ) -> None:
     """
     Train a low-resolution 3DGS model using the official train_lr.py script.
@@ -278,8 +279,9 @@ def train_lr_phase(
         "--test_iterations",       *[str(i) for i in test_iterations],
         "--save_iterations",       *[str(i) for i in save_iterations],
         "--checkpoint_iterations", *[str(i) for i in sorted(set(list(checkpoint_iterations) + [iterations]))],
-        "--quiet",
     ]
+    if quiet:
+        cmd.append("--quiet")
     if white_bg:
         cmd.append("--white_background")
     cmd.extend(extra_train_args)
@@ -340,6 +342,7 @@ def train_sr_phase(
     img_ext: str,
     extra_train_args: list[str],
     log_file: Path,
+    quiet: bool,
 ) -> None:
     """
     Train SplatSuRe with selective SR supervision.
@@ -367,8 +370,10 @@ def train_sr_phase(
         "--test_iterations",       *[str(i) for i in test_iterations],
         "--save_iterations",       *[str(i) for i in save_iterations],
         "--checkpoint_iterations", *[str(i) for i in checkpoint_iterations],
-        "--quiet",
+        
     ]
+    if quiet:
+        cmd.append("--quiet")
     if white_bg:
         cmd.append("--white_background")
     cmd.extend(extra_train_args)
@@ -525,6 +530,7 @@ def main() -> int:
                         help="Extra args forwarded to train.py (SR phase) ONLY "
                              "(use for SR-specific args such as --gamma that train_lr.py does not accept)")
     parser.add_argument("--extra-render-args", type=str, default="")
+    parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
 
@@ -626,6 +632,7 @@ def main() -> int:
                     white_bg=args.white_bg,
                     extra_train_args=extra_train_args + extra_lr_args,
                     log_file=log_file,
+                    quiet= args.quiet,
                 )
             else:
                 print(f"[Step 1] Skipped (--skip-lr-phase).")
@@ -681,6 +688,7 @@ def main() -> int:
                     img_ext=img_ext,
                     extra_train_args=final_sr_args,
                     log_file=log_file,
+                    quiet = args.quiet
                 )
             else:
                 # Verify the SR model actually exists before trying to render

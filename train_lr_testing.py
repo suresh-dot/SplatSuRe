@@ -15,7 +15,6 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from transformers import AutoModelForDepthEstimation
 import os
-import json
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -28,13 +27,17 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-
+try:
+    from gsplat import rasterization
+    GSPLAT_AVAILABLE = True
+except ImportError:
+    GSPLAT_AVAILABLE = False
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-TENSORBOARD_FOUND = False
+
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
@@ -56,27 +59,6 @@ def pearson_corr_loss(pred_depth, mono_depth):
     # 1.0 - mean(a * b) minimizes to 0 when perfectly positively correlated
     return 1.0 - (pred_depth * mono_depth).mean()
 
-def order_cameras_by_proximity(cameras):
-    """
-    Order cameras via greedy nearest-neighbor traversal of their world-space
-    camera centers, so consecutive cameras are spatially adjacent (used for
-    pseudo-view interpolation instead of relying on filename ordering).
-    """
-    centers = torch.stack([c.camera_center.detach().cpu() for c in cameras])  # [N, 3]
-    n = len(cameras)
-    visited = torch.zeros(n, dtype=torch.bool)
-
-    order = [0]
-    visited[0] = True
-    for _ in range(n - 1):
-        last_center = centers[order[-1]]
-        dists = torch.norm(centers - last_center, dim=1)
-        dists[visited] = float('inf')
-        nxt = torch.argmin(dists).item()
-        order.append(nxt)
-        visited[nxt] = True
-
-    return [cameras[i] for i in order]
 def interpolate_pseudo_camera(cam_a, cam_b, t):
     from utils.graphics_utils import getWorld2View2
     # SLERP Rotation via SVD
@@ -107,59 +89,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
-    # Resolve pseudo-view pair-distance guard relative to scene scale if not set
-    if args.pseudo_view_max_pair_dist is None:
-        args.pseudo_view_max_pair_dist = 0.5 * scene.cameras_extent
     # ── Pure GPU DA-V2 Initialization ──
     da_v2_model = None
     normalize_transform = None
     if args.pseudo_view_weight > 0:
-        if args.pseudo_view_model_path:
-            # model_source = os.path.expanduser(args.pseudo_view_model_path)
-            model_source = '/home/suresh/.cache/huggingface/hub/models--depth-anything--Depth-Anything-V2-Large-hf/snapshots/7581137eff8d4e94f6e796d3baea0e9fa79b22d2'
-            if not os.path.exists(model_source):
-                raise FileNotFoundError(f"local pseudo-view model path not found: {model_source}")
-        else:
-            model_source = f"depth-anything/Depth-Anything-V2-{args.pseudo_view_model_size.capitalize()}-hf"
-
-        print(f"[FSGS] Loading {model_source} for Pseudo-View Regularization...")
-        da_v2_model = AutoModelForDepthEstimation.from_pretrained(
-            model_source,
-            local_files_only=not args.pseudo_view_allow_download,
-        ).to("cuda").eval()
+        model_id = f"depth-anything/Depth-Anything-V2-{args.pseudo_view_model_size.capitalize()}-hf"
+        print(f"[FSGS] Loading {model_id} for Pseudo-View Regularization...")
+        da_v2_model = AutoModelForDepthEstimation.from_pretrained(model_id).to("cuda").eval()
         for p in da_v2_model.parameters(): 
             p.requires_grad_(False)
         # Standard ImageNet normalization required by DA-V2 Transformers
         normalize_transform = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    # train_cams_sorted = sorted(scene.getTrainCameras(), key=lambda c: c.image_name)
-    train_cams_sorted = order_cameras_by_proximity(scene.getTrainCameras())
 
-    # ===================================================================
-    # FLOAT32 DEPTH INJECTION - LOAD CACHE (same as train.py SR phase)
-    # ===================================================================
-    depth_cache = {}
-    depth_json_path = os.path.join(dataset.source_path, "sparse", "0", "depth_params.json")
-    depth_npy_dir = os.path.join(dataset.source_path, "depths_npy")
-
-    if os.path.exists(depth_json_path):
-        with open(depth_json_path, 'r') as f:
-            depth_params = json.load(f)
-
-        print(f"\nLoading high-precision depth maps from {depth_npy_dir}...")
-        for cam in train_cams_sorted:
-            stem = os.path.splitext(cam.image_name)[0]
-            if stem in depth_params:
-                params = depth_params[stem]
-                # Scale-Invariant Reliability Check
-                if params['n_inliers'] >= 8 and params['pearson'] > 0.3:
-                    npy_path = os.path.join(depth_npy_dir, f"{stem}.npy")
-                    if os.path.exists(npy_path):
-                        raw_depth = np.load(npy_path)
-                        # Apply alignment perfectly in pure float32
-                        aligned = params['scale'] * raw_depth + params['offset']
-                        depth_cache[cam.uid] = torch.from_numpy(aligned).cuda()
-        print(f"Successfully loaded {len(depth_cache)} reliable float32 depth maps.\n")
-    # ===================================================================
+    train_cams_sorted = sorted(scene.getTrainCameras(), key=lambda c: c.image_name)
 
     gaussians.training_setup(opt)
     if checkpoint:
@@ -175,12 +117,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = train_cams_sorted.copy()
+    viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-    ema_loss_pseudo_for_log = 0.0   # add this
 
+    # --- GH200 OPTIMIZATION: Pre-load to VRAM ---
+    print("Pre-loading all training data to GH200 VRAM...")
+    for cam in scene.getTrainCameras():
+        cam.original_image = cam.original_image.cuda()
+        if cam.alpha_mask is not None:
+            cam.alpha_mask = cam.alpha_mask.cuda()
+        if cam.depth_reliable:
+            cam.invdepthmap = cam.invdepthmap.cuda()
+            cam.depth_mask = cam.depth_mask.cuda()
+    # --------------------------------------------
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -209,7 +160,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = train_cams_sorted.copy()
+            viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
@@ -220,16 +171,77 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        if not GSPLAT_AVAILABLE:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        else:
+            # 1. Extract standard K matrix from FoV
+            fx = (viewpoint_cam.image_width / 2) / math.tan(viewpoint_cam.FoVx / 2.)
+            fy = (viewpoint_cam.image_height / 2) / math.tan(viewpoint_cam.FoVy / 2.)
+            K = torch.tensor([[fx, 0, viewpoint_cam.image_width/2],
+                            [0, fy, viewpoint_cam.image_height/2],
+                            [0,  0, 1]], device="cuda", dtype=torch.float32).unsqueeze(0)
             
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            # 2. Extract View Matrix (World to Camera)
+            viewmat = viewpoint_cam.world_view_transform.transpose(0, 1).unsqueeze(0)
+            # print("begin rasterization........")
+            bg_4d = torch.cat([bg, torch.tensor([0.0], device="cuda")])
+            # 3. Call gsplat (using RGB+ED to get Expected Depth for your loss later)
+            colors, alphas, meta = rasterization(
+                means=gaussians.get_xyz,
+                quats=gaussians.get_rotation,
+                scales=gaussians.get_scaling,
+                opacities=gaussians.get_opacity.squeeze(-1),
+                colors=gaussians.get_features,
+                viewmats=viewmat,
+                Ks=K,
+                width=viewpoint_cam.image_width,
+                height=viewpoint_cam.image_height,
+                sh_degree=gaussians.active_sh_degree,
+                render_mode="RGB+ED", # Gets RGB + Expected Depth
+                # backgrounds=bg_4d.unsqueeze(0)
+            )
+            # print("Rasterization complete")
+            # 4. Map outputs back to your variables
+            # gsplat returns [Batch, Height, Width, Channels], PyTorch needs [C, H, W]
+            image = colors[0, :, :, :3].permute(2, 0, 1) 
+            alpha = alphas[0].permute(2, 0, 1) # Shape: [1, H, W]
+            
+            # 2. Manually composite the background (Mathematically identical to the rasterizer)
+            image = image + (1.0 - alpha) * bg.view(3, 1, 1)
+            
+            # 3. Extract Depth and tracking variables
+            invDepth = colors[0, :, :, 3].unsqueeze(0)
+            
+            # --- SYNCHRONIZATION FIX ---
+            N = gaussians.get_xyz.shape[0] 
+            
+            if gaussians.max_radii2D.shape[0] != N:
+                gaussians.max_radii2D = torch.zeros((N,), device="cuda")
+                
+            # Safely force radii to be EXACTLY size N (pads if too short, truncates if too long)
+            raw_radii = meta["radii"].flatten()
+            radii = torch.zeros((N,), device="cuda", dtype=raw_radii.dtype)
+            copy_len = min(N, raw_radii.shape[0])
+            radii[:copy_len] = raw_radii[:copy_len]
+                
+            visibility_filter = radii > 0
+            
+            # --- DENSIFICATION FIX ---
+            means2d = meta["means2d"]
+            means2d.retain_grad()
+            
+            viewspace_point_tensor = torch.zeros((N, 2), device="cuda", requires_grad=True)
+            viewspace_point_tensor.retain_grad()
+            # ---------------------------
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        # gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -239,27 +251,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
-        # ===================================================================
-        # FLOAT32 DEPTH LOSS CALCULATION (same cache approach as train.py)
-        # ===================================================================
-        depth_weight_current = depth_l1_weight(iteration)
-        Ll1depth = 0.0
-        loss_pseudo_log = 0.0   # add this default
-
-        if depth_weight_current > 0 and viewpoint_cam.uid in depth_cache:
-            invDepth_pred = render_pkg["depth"]
-            mono_target = depth_cache[viewpoint_cam.uid]
-
-            if invDepth_pred.shape[1:] != mono_target.shape:
-                mono_target_rs = F.interpolate(mono_target.unsqueeze(0).unsqueeze(0),
-                                               size=invDepth_pred.shape[1:], mode='bilinear')[0, 0]
-            else:
-                mono_target_rs = mono_target
-
-            loss_depth = torch.abs(invDepth_pred.squeeze() - mono_target_rs).mean()
-            loss += depth_weight_current * loss_depth
-            Ll1depth = (depth_weight_current * loss_depth).item()
-        # ===================================================================
+        Ll1depth_pure = 0.0
+        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
+            if not GSPLAT_AVAILABLE: 
+                invDepth = render_pkg["depth"]
+            # mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+            # depth_mask = viewpoint_cam.depth_mask.cuda()
+            mono_invdepth = viewpoint_cam.invdepthmap
+            depth_mask = viewpoint_cam.depth_mask
+            
+            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            loss += Ll1depth
+            Ll1depth = Ll1depth.item()
+        else:
+            Ll1depth = 0
 
         # ===================================================================
         # FSGS: Pseudo-View Depth Regularization 
@@ -267,84 +273,69 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (da_v2_model is not None 
             and args.pseudo_view_start < iteration < args.pseudo_view_end # Corrected bounds
             and iteration % args.pseudo_view_interval == 0):
-            # print("using depth reg")
             
             # 1. Sample interpolation
             i = randint(0, len(train_cams_sorted) - 2)
-            cam_a, cam_b = train_cams_sorted[i], train_cams_sorted[i + 1]
-            pair_dist = torch.norm(cam_a.camera_center - cam_b.camera_center).item()
-
-            if pair_dist > args.pseudo_view_max_pair_dist:  # skip bad long jumps from the spatial sort
-                pass
-            else:
-                t = 0.3 + 0.4 * torch.rand(1).item() # Keep it between 0.3 and 0.7
-                p_cam = interpolate_pseudo_camera(cam_a, cam_b, t)
+            t = 0.3 + 0.4 * torch.rand(1).item() # Keep it between 0.3 and 0.7
+            p_cam = interpolate_pseudo_camera(train_cams_sorted[i], train_cams_sorted[i + 1], t)
             
-                # 2. Render Virtual View
-                p_pkg = render(p_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-                rgb_p = p_pkg["render"].clamp(0, 1)
+            # 2. Render Virtual View
+            p_pkg = render(p_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            rgb_p = p_pkg["render"].clamp(0, 1)
+            
+            # 3. Pure-GPU DA-V2 Inference
+            with torch.no_grad():
+                H, W = rgb_p.shape[1:]
+                rgb_resized = F.interpolate(rgb_p.unsqueeze(0), size=(518, 518), mode='bilinear', align_corners=False)
+                da_input = normalize_transform(rgb_resized)
                 
-                # 3. Pure-GPU DA-V2 Inference
-                with torch.no_grad():
-                    H, W = rgb_p.shape[1:]
-                    rgb_resized = F.interpolate(rgb_p.unsqueeze(0), size=(518, 518), mode='bilinear', align_corners=False)
-                    da_input = normalize_transform(rgb_resized)
-                    
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        mono_inv_p_518 = da_v2_model(da_input).predicted_depth # [1, 518, 518]
-                    mono_inv_p = F.interpolate(mono_inv_p_518.unsqueeze(1).float(), size=(H, W), mode='bilinear', align_corners=False).squeeze()
-                
-                # 4. Pearson Correlation Loss
-                # FIXED: Both p_pkg["depth"] and mono_inv_p are inverse depth. Do not invert.
-                inv_d_p = p_pkg["depth"].squeeze() 
-                loss_pseudo = args.pseudo_view_weight * pearson_corr_loss(inv_d_p, mono_inv_p)
-                loss += loss_pseudo
-                loss_pseudo_log = loss_pseudo.item()   # add this
-
-                # 5. Optionally save the pseudo-view RGB, GS depth, and Depth Anything V2 depth
-                if iteration % 1000 == 0 or iteration in testing_iterations:
-                    pseudo_save_dir = os.path.join(scene.model_path, "pseudo_views", f"iteration_{iteration}")
-                    os.makedirs(pseudo_save_dir, exist_ok=True)
-                    from torchvision.utils import save_image
-                    
-                    # Save pseudo RGB
-                    save_image(rgb_p, os.path.join(pseudo_save_dir, "rgb.png"))
-                    
-                    # Save GS rendered depth (inv_d_p)
-                    save_image(inv_d_p[None], os.path.join(pseudo_save_dir, "gs_depth.png"), normalize=True)
-                    torch.save(inv_d_p.cpu(), os.path.join(pseudo_save_dir, "gs_depth.pt"))
-                    
-                    # Save Depth Anything predicted depth (mono_inv_p)
-                    save_image(mono_inv_p[None], os.path.join(pseudo_save_dir, "da_depth.png"), normalize=True)
-                    torch.save(mono_inv_p.cpu(), os.path.join(pseudo_save_dir, "da_depth.pt"))
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    mono_inv_p_518 = da_v2_model(da_input).predicted_depth # [1, 518, 518]
+                mono_inv_p = F.interpolate(mono_inv_p_518.unsqueeze(1).float(), size=(H, W), mode='bilinear', align_corners=False).squeeze()
+            
+            # 4. Pearson Correlation Loss
+            # FIXED: Both p_pkg["depth"] and mono_inv_p are inverse depth. Do not invert.
+            inv_d_p = p_pkg["depth"].squeeze() 
+            loss_pseudo = args.pseudo_view_weight * pearson_corr_loss(inv_d_p, mono_inv_p)
+            loss += loss_pseudo
         # ===================================================================
 
 
         loss.backward()
 
+        # --- GSPLAT DENSIFICATION BRIDGE ---
+        if means2d.grad is not None:
+            raw_grad = means2d.grad.squeeze(0)
+            M = raw_grad.shape[0]
+            
+            # Create a clean gradient tensor of exact size N
+            safe_grad = torch.zeros((N, 2), device="cuda")
+            
+            # Copy over exactly what exists without going out of bounds
+            copy_len = min(N, M)
+            safe_grad[:copy_len, :] = raw_grad[:copy_len, :2].clone()
+            
+            viewspace_point_tensor.grad = safe_grad
+        else:
+            viewspace_point_tensor.grad = torch.zeros((N, 2), device="cuda")
+            copy_len = min(N, gaussians._xyz.grad.shape[0])
+            viewspace_point_tensor.grad[:copy_len, :] = gaussians._xyz.grad[:copy_len, :2].clone()
+        # -----------------------------------
         iter_end.record()
 
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-            ema_loss_pseudo_for_log = 0.4 * loss_pseudo_log + 0.6 * ema_loss_pseudo_for_log  # add this
-
-            if tb_writer:
-                tb_writer.add_scalar('train_loss_patches/pseudo_view_loss', loss_pseudo_log, iteration)
 
             if iteration % 100 == 0:
-                progress_bar.set_postfix({
-                    "Loss": f"{ema_loss_for_log:.{7}f}",
-                    "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
-                    "Pseudo Loss": f"{ema_loss_pseudo_for_log:.{7}f}",   # add this
-                })
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(100)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, depth_cache)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -400,7 +391,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, depth_cache=None):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -408,7 +399,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
     # Report test and samples of training set
     if iteration in testing_iterations:
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
@@ -416,54 +407,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
-                depth_save_dir = os.path.join(scene.model_path, "depth_renders", f"iteration_{iteration}", config['name'])
-                os.makedirs(depth_save_dir, exist_ok=True)
                 for idx, viewpoint in enumerate(config['cameras']):
-                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
-                    image = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                    depth = render_pkg["depth"] # shape [1, H, W]
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    
-                    # Save depth map to disk as visual PNG and raw torch tensor
-                    from torchvision.utils import save_image
-                    img_name_without_ext = os.path.splitext(viewpoint.image_name)[0]
-                    depth_png_path = os.path.join(depth_save_dir, img_name_without_ext + ".png")
-                    os.makedirs(os.path.dirname(depth_png_path), exist_ok=True)
-                    save_image(depth, depth_png_path, normalize=True)
-                    
-                    depth_pt_path = os.path.join(depth_save_dir, img_name_without_ext + ".pt")
-                    torch.save(depth.cpu(), depth_pt_path)
-                    
-                    # If ground truth depth exists (from cache), save it as well
-                    if viewpoint.uid in depth_cache:
-                        gt_depth = depth_cache[viewpoint.uid].cpu()
-                        # Manual normalization to avoid 0/0 when all values are identical
-                        gt_depth_min = gt_depth.min()
-                        gt_depth_max = gt_depth.max()
-                        if gt_depth_max - gt_depth_min > 1e-6:
-                            gt_depth_norm = (gt_depth - gt_depth_min) / (gt_depth_max - gt_depth_min + 1e-8)
-                        else:
-                            gt_depth_norm = torch.zeros_like(gt_depth)
-                        gt_depth_png_path = os.path.join(depth_save_dir, img_name_without_ext + "_gt.png")
-                        save_image(gt_depth_norm, gt_depth_png_path)
-                        gt_depth_pt_path = os.path.join(depth_save_dir, img_name_without_ext + "_gt.pt")
-                        torch.save(gt_depth, gt_depth_pt_path)
-
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        # Normalize depth for tensorboard
-                        d_min, d_max = depth.min(), depth.max()
-                        depth_norm = (depth - d_min) / (d_max - d_min + 1e-5)
-                        tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name), depth_norm[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                            if viewpoint.uid in depth_cache:
-                                gt_d_min, gt_d_max = gt_depth.min(), gt_depth.max()
-                                gt_depth_norm = (gt_depth - gt_d_min) / (gt_d_max - gt_d_min + 1e-5)
-                                tb_writer.add_images(config['name'] + "_view_{}/ground_truth_depth".format(viewpoint.image_name), gt_depth_norm[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
@@ -476,7 +429,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -502,13 +455,6 @@ if __name__ == "__main__":
     parser.add_argument("--pseudo_view_start", type=int, default=2000)
     parser.add_argument("--pseudo_view_end", type=int, default=10000) # ADD THIS LINE
     parser.add_argument("--pseudo_view_model_size", type=str, default="small", choices=["small", "base", "large"])
-    parser.add_argument("--pseudo_view_model_path", type=str, default=None,
-                        help="Local Hugging Face snapshot directory for pseudo-view DA-V2")
-    parser.add_argument("--pseudo_view_allow_download", action="store_true",
-                        help="Allow downloading missing pseudo-view model files; default is local cache only")
-    parser.add_argument("--pseudo_view_max_pair_dist", type=float, default=None,
-                        help="Max camera-center distance for a pseudo-view pair; pairs farther apart are skipped. "
-                             "If None, defaults to 0.5 * scene.cameras_extent.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     

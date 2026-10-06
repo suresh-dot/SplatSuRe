@@ -14,19 +14,55 @@ IMAGE_EXTS = {".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG"}
 ALL_SCENES = ["aeroplane", "bike", "buddha", "cycle", "face", "firehydrant", "still3", "toy"]
 
 # ── Depth-Anything-V2 wrapper ────────────────────────────────────────────────
+# ── Depth-Anything-V2 wrapper ────────────────────────────────────────────────
 class DepthAnythingV2Wrapper:
+    """
+    A wrapper class for loading and running inference with Depth-Anything-V2 models.
+    Supports Hugging Face pretrained checkpoints of different sizes (small, base, large)
+    and optional depth inversion (converting depth to inverse depth or vice versa).
+    """
     HF_MODELS = {
         "small": "depth-anything/Depth-Anything-V2-Small-hf",
         "base":  "depth-anything/Depth-Anything-V2-Base-hf",
         "large": "depth-anything/Depth-Anything-V2-Large-hf",
     }
 
-    def __init__(self, size: str = "large", device: str = "cuda", invert: bool = False):
+    def __init__(
+        self,
+        size: str = "large",
+        device: str = "cuda",
+        invert: bool = False,
+        model_path: Path | None = None,
+        local_files_only: bool = True,
+    ):
+        """
+        Initializes the Depth-Anything-V2 model and image processor.
+        
+        Args:
+            size (str): Size model to use ('small', 'base', 'large').
+            device (str): Device to run inference on (e.g., 'cuda', 'cpu').
+            invert (bool): If True, inverts the output depth map (1 / (d + 1e-3)).
+            model_path (Path | None): Optional local Hugging Face snapshot directory.
+            local_files_only (bool): If True, do not download missing model files.
+        """
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-        model_id = self.HF_MODELS[size]
-        print(f"[depth] loading {model_id} on {device}…")
-        self.processor = AutoImageProcessor.from_pretrained(model_id)
-        self.model = AutoModelForDepthEstimation.from_pretrained(model_id).to(device).eval()
+
+        if model_path is not None:
+            model_source = str(model_path.expanduser())
+            if not Path(model_source).exists():
+                raise FileNotFoundError(f"local model path not found: {model_source}")
+        else:
+            model_source = self.HF_MODELS[size]
+
+        print(f"[depth] loading {model_source} on {device}...")
+        self.processor = AutoImageProcessor.from_pretrained(
+            model_source,
+            local_files_only=local_files_only,
+        )
+        self.model = AutoModelForDepthEstimation.from_pretrained(
+            model_source,
+            local_files_only=local_files_only,
+        ).to(device).eval()
         self.device = device
         self.invert = invert
         if invert:
@@ -34,34 +70,67 @@ class DepthAnythingV2Wrapper:
 
     @torch.no_grad()
     def infer(self, pil_image: Image.Image) -> np.ndarray:
+        """
+        Runs monocular depth estimation on a single PIL Image.
+        
+        Args:
+            pil_image (Image.Image): Input RGB image.
+            
+        Returns:
+            np.ndarray: Predicted depth map resized to the input image dimensions.
+        """
         W, H = pil_image.size
+        # Preprocess and prepare inputs for Hugging Face Transformers
         inputs = self.processor(images=pil_image, return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
         pred = outputs.predicted_depth
+        
+        # Resize predicted depth back to the original image resolution using bicubic interpolation
         pred_resized = torch.nn.functional.interpolate(
             pred.unsqueeze(1), size=(H, W), mode="bicubic", align_corners=False
         ).squeeze().cpu().numpy().astype(np.float32)
+        
+        # Ensure values are non-negative
         pred_resized = np.clip(pred_resized, 0.0, None)
         if self.invert:
             pred_resized = 1.0 / (pred_resized + 1e-3)
         return pred_resized
 
 # ── COLMAP loading ──────────────────────────────────────────────────────────
+# ── COLMAP loading ──────────────────────────────────────────────────────────
 def _read_points3D_binary_as_dict(path: Path) -> dict:
+    """
+    Parses a COLMAP points3D.bin binary file and extracts 3D coordinates.
+    
+    Args:
+        path (Path): Path to the points3D.bin file.
+        
+    Returns:
+        dict: A dictionary mapping 3D point IDs to their corresponding [X, Y, Z] positions.
+    """
     points3D: dict[int, np.ndarray] = {}
     with open(path, "rb") as f:
         (num_points,) = struct.unpack("<Q", f.read(8))
         for _ in range(num_points):
             (point_id,) = struct.unpack("<Q", f.read(8))
             xyz = np.array(struct.unpack("<ddd", f.read(24)), dtype=np.float64)
-            _ = f.read(3)
-            _ = f.read(8)
+            _ = f.read(3) # RGB colors (unused)
+            _ = f.read(8) # Error metric (unused)
             (track_length,) = struct.unpack("<Q", f.read(8))
-            _ = f.read(8 * track_length)
+            _ = f.read(8 * track_length) # 2D image observations track (unused)
             points3D[int(point_id)] = xyz
     return points3D
 
 def _read_points3D_text_as_dict(path: Path) -> dict:
+    """
+    Parses a COLMAP points3D.txt text file and extracts 3D coordinates.
+    
+    Args:
+        path (Path): Path to the points3D.txt file.
+        
+    Returns:
+        dict: A dictionary mapping 3D point IDs to their corresponding [X, Y, Z] positions.
+    """
     points3D: dict[int, np.ndarray] = {}
     with open(path, "r") as f:
         for line in f:
@@ -74,6 +143,17 @@ def _read_points3D_text_as_dict(path: Path) -> dict:
     return points3D
 
 def load_colmap(repo_root: Path, scene_dir: Path):
+    """
+    Loads COLMAP reconstruction data (intrinsics, extrinsics, 3D points) for a scene.
+    Supports both binary (.bin) and text (.txt) formats automatically.
+    
+    Args:
+        repo_root (Path): Root folder of the SplatSuRe repository.
+        scene_dir (Path): Scene directory containing sparse/0.
+        
+    Returns:
+        tuple: (cams_intrinsic, cams_extrinsic, points3D) dictionaries.
+    """
     sys.path.insert(0, str(repo_root))
     from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, read_extrinsics_text, read_intrinsics_text
     sparse = scene_dir / "sparse" / "0"
@@ -88,6 +168,9 @@ def load_colmap(repo_root: Path, scene_dir: Path):
     return cams_intrinsic, cams_extrinsic, points3D
 
 def qvec_to_rotmat(qvec):
+    """
+    Converts a quaternion [w, x, y, z] to a 3x3 rotation matrix.
+    """
     w, x, y, z = qvec
     return np.array([
         [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w,     2*x*z + 2*y*w    ],
@@ -98,6 +181,10 @@ def qvec_to_rotmat(qvec):
 PINHOLE_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
 
 def get_intrinsic_matrix(cam_intrinsic):
+    """
+    Constructs the 3x3 Camera Intrinsic Matrix (K) from a COLMAP camera record.
+    Supports SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, and FULL_OPENCV models.
+    """
     model = cam_intrinsic.model
     if isinstance(model, bytes):
         model = model.decode("utf-8")
@@ -118,6 +205,9 @@ def get_intrinsic_matrix(cam_intrinsic):
     return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
 
 def check_scene_camera_models(cams_intrinsic: dict, scene_name: str) -> bool:
+    """
+    Verifies if all cameras in a scene are compatible pinhole camera models.
+    """
     seen = {}
     for c in cams_intrinsic.values():
         m = c.model.decode("utf-8") if isinstance(c.model, bytes) else c.model
@@ -129,33 +219,61 @@ def check_scene_camera_models(cams_intrinsic: dict, scene_name: str) -> bool:
 
 # ── alignment ───────────────────────────────────────────────────────────────
 def align_one_image(da_invdepth: np.ndarray, image_record, intrinsic_record, points3D: dict, min_points: int = 8, max_points: int = 5000) -> tuple[float, float, int, float]:
+    """
+    Aligns a monocular predicted inverse depth map with sparse COLMAP 3D points.
+    Since monocular depth has scale and shift ambiguity, we project the 3D points
+    into the camera frame, obtain their depth (z), and perform a robust linear 
+    regression (RANSAC) to solve for:
+        colmap_inv_depth = scale * monocular_inv_depth + offset
+        
+    Args:
+        da_invdepth (np.ndarray): Predicted monocular inverse depth map [H, W].
+        image_record: Extrinsics record of the camera image from COLMAP.
+        intrinsic_record: Intrinsics record of the camera from COLMAP.
+        points3D (dict): Dictionary of all reconstruction 3D points.
+        min_points (int): Minimum required points for alignment.
+        max_points (int): Maximum points to keep for fitting to speed up.
+        
+    Returns:
+        tuple: (best_scale, best_off, best_inl, pearson)
+            best_scale (float): Scaling factor.
+            best_off (float): Offset/shift factor.
+            best_inl (int): Number of RANSAC inliers.
+            pearson (float): Pearson correlation coefficient between monocular and COLMAP inv depth.
+    """
     K = get_intrinsic_matrix(intrinsic_record)
     R = qvec_to_rotmat(image_record.qvec)
     t = np.asarray(image_record.tvec).reshape(3, 1)
     H, W = da_invdepth.shape
 
+    # Find the IDs of the 3D points observed in this image
     p3d_ids = image_record.point3D_ids
     valid = p3d_ids != -1
     p3d_ids = p3d_ids[valid]
     if p3d_ids.size == 0:
         return 1.0, 0.0, 0, 0.0
 
+    # Retrieve the 3D coordinates for the observed points
     coords = [points3D[int(pid)] for pid in p3d_ids if int(pid) in points3D]
     if not coords:
         return 1.0, 0.0, 0, 0.0
     coords = np.asarray(coords, dtype=np.float64)
 
+    # Project the 3D points into camera coordinates (cam = R * coords + t)
     cam = (R @ coords.T + t).T
     z = cam[:, 2]
-    in_front = z > 1e-3
+    in_front = z > 1e-3 # Filter out points behind or too close to the camera
     cam = cam[in_front]
     if cam.shape[0] < min_points:
         return 1.0, 0.0, 0, 0.0
     z = cam[:, 2]
 
+    # Project camera coordinates onto the image plane (uv = K * cam)
     uv = (K @ cam.T).T
     u = uv[:, 0] / uv[:, 2]
     v = uv[:, 1] / uv[:, 2]
+    
+    # Filter points that project within the image boundaries
     on_screen = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     if on_screen.sum() < min_points:
         return 1.0, 0.0, 0, 0.0
@@ -163,9 +281,12 @@ def align_one_image(da_invdepth: np.ndarray, image_record, intrinsic_record, poi
     u = u[on_screen].astype(np.int64)
     v = v[on_screen].astype(np.int64)
     z = z[on_screen]
+    
+    # Compute inverse depth from COLMAP (1 / z) and retrieve corresponding monocular inv depth values
     colmap_inv = (1.0 / z).astype(np.float64)
     da_inv = da_invdepth[v, u].astype(np.float64)
 
+    # Compute Pearson correlation coefficient to ensure the depth directions match
     pearson = 0.0
     if da_inv.size > 2 and da_inv.std() > 1e-12 and colmap_inv.std() > 1e-12:
         pearson = float(np.corrcoef(da_inv, colmap_inv)[0, 1])
@@ -181,13 +302,16 @@ def align_one_image(da_invdepth: np.ndarray, image_record, intrinsic_record, poi
         return 1.0, 0.0, 0, pearson
     n_iters = max(50, min(300, n))
     
+    # Estimate standard deviation (MAD) of residuals using all points to define the RANSAC threshold
     A0 = np.stack([da_inv, np.ones_like(da_inv)], axis=1)
     s0, o0 = np.linalg.lstsq(A0, colmap_inv, rcond=None)[0]
     resid0 = colmap_inv - (s0 * da_inv + o0)
     mad = np.median(np.abs(resid0 - np.median(resid0))) + 1e-9
     thresh = 3.0 * mad
 
+    # Run RANSAC to find the best scale and offset
     for _ in range(n_iters):
+        # Randomly sample 3 points to determine a candidate fit
         idx = rng.choice(n, size=min(3, n), replace=False)
         A = np.stack([da_inv[idx], np.ones(idx.size)], axis=1)
         try:
@@ -196,12 +320,15 @@ def align_one_image(da_invdepth: np.ndarray, image_record, intrinsic_record, poi
             continue
         if not np.isfinite(s) or not np.isfinite(o):
             continue
+        
+        # Calculate residuals and count inliers
         resid = colmap_inv - (s * da_inv + o)
         inl = np.abs(resid) < thresh
         if inl.sum() > best_inl:
             best_inl = inl.sum()
             best_scale, best_off = float(s), float(o)
 
+    # Perform a final least-squares fit using all RANSAC inliers
     final_resid = colmap_inv - (best_scale * da_inv + best_off)
     inliers = np.abs(final_resid) < thresh
     if inliers.sum() >= 3:
@@ -214,26 +341,76 @@ def align_one_image(da_invdepth: np.ndarray, image_record, intrinsic_record, poi
     return best_scale, best_off, best_inl, pearson
 
 # ── per-scene pipeline ──────────────────────────────────────────────────────
+# ── per-scene pipeline ──────────────────────────────────────────────────────
 def list_images(folder: Path) -> list[Path]:
+    """
+    Returns a sorted list of image file paths from the specified folder.
+    """
     return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix in IMAGE_EXTS])
 
 def stem_no_ext(image_name: str) -> str:
+    """
+    Extracts the stem name of a file path (the name without directories or suffix).
+    """
     return Path(image_name).stem
 
-def run_inference_for_scene(scene_dir: Path, depths_dir: Path, model: DepthAnythingV2Wrapper, overwrite: bool):
+def run_inference_for_scene(scene_dir: Path, depths_dir: Path, model: DepthAnythingV2Wrapper, overwrite: bool, save_image: bool = False):
+    """
+    Runs Depth-Anything-V2 inference on all images in a scene and saves the raw outputs.
+    Optionally saves a visual colormapped depth map as a PNG image.
+    
+    Args:
+        scene_dir (Path): Scene directory containing images/.
+        depths_dir (Path): Output directory where .npy depth maps will be saved.
+        model (DepthAnythingV2Wrapper): The initialized depth model wrapper.
+        overwrite (bool): If True, replaces existing files.
+        save_image (bool): If True, saves colormapped depth images alongside the NPY files.
+    """
     images_dir = scene_dir / "images"
     images = list_images(images_dir)
     depths_dir.mkdir(parents=True, exist_ok=True)
 
     for img_path in tqdm(images, desc=f"  DA-V2 [{scene_dir.name}]", leave=False):
         out_npy = depths_dir / f"{img_path.stem}.npy"
-        if out_npy.exists() and not overwrite:
+        out_png = depths_dir / f"{img_path.stem}.png"
+        
+        # Check if we can skip inference/visualization
+        if out_npy.exists() and (not save_image or out_png.exists()) and not overwrite:
             continue
-        pil = Image.open(img_path).convert("RGB")
-        invdepth = model.infer(pil)
-        np.save(out_npy, invdepth.astype(np.float32))
+            
+        # Get depth map (either by loading or inference)
+        if out_npy.exists() and not overwrite:
+            invdepth = np.load(out_npy)
+        else:
+            if model is None:
+                continue
+            pil = Image.open(img_path).convert("RGB")
+            invdepth = model.infer(pil)
+            np.save(out_npy, invdepth.astype(np.float32))
+            
+        if save_image:
+            # Normalize to [0, 255] and apply a colormap to save as a visual RGB image
+            d_min, d_max = invdepth.min(), invdepth.max()
+            if d_max - d_min > 1e-5:
+                invdepth_norm = ((invdepth - d_min) / (d_max - d_min) * 255.0).astype(np.uint8)
+            else:
+                invdepth_norm = np.zeros_like(invdepth, dtype=np.uint8)
+            # Use OpenCV to apply INFERNO colormap and save the visual RGB representation
+            color_depth = cv2.applyColorMap(invdepth_norm, cv2.COLORMAP_INFERNO)
+            cv2.imwrite(str(out_png), color_depth)
 
 def align_scene(scene_dir: Path, depths_dir: Path, repo_root: Path) -> dict:
+    """
+    Aligns the pre-generated monocular depth maps for all cameras in a scene.
+    
+    Args:
+        scene_dir (Path): Scene directory.
+        depths_dir (Path): Directory containing pre-generated .npy depth maps.
+        repo_root (Path): Repository root path (to load colmap loaders).
+        
+    Returns:
+        dict: Alignment parameters, statistics, and scale factors.
+    """
     cams_intrinsic, cams_extrinsic, points3D = load_colmap(repo_root, scene_dir)
     check_scene_camera_models(cams_intrinsic, scene_dir.name)
     intrinsic_by_id = {c.id: c for c in cams_intrinsic.values()}
@@ -253,6 +430,7 @@ def align_scene(scene_dir: Path, depths_dir: Path, repo_root: Path) -> dict:
         if intr is None:
             continue
 
+        # Align this specific image's monocular depth map to COLMAP points
         scale, offset, n_inl, pearson = align_one_image(da_inv, img_record, intr, points3D)
         depth_params[stem] = {
             "scale":  float(scale),
@@ -264,12 +442,14 @@ def align_scene(scene_dir: Path, depths_dir: Path, repo_root: Path) -> dict:
             n_aligned += 1
             correlations.append(pearson)
 
+    # Compute median scale across all validly aligned camera frames
     valid_scales = [v["scale"] for v in depth_params.values() if v["n_inliers"] >= 8]
     med_scale = float(np.median(valid_scales)) if valid_scales else 1.0
     
     for k in depth_params:
         depth_params[k]["med_scale"] = med_scale
 
+    # Log pearson correlation status
     if correlations:
         med_corr = float(np.median(correlations))
         n_pos = sum(1 for c in correlations if c > 0.3)
@@ -285,6 +465,9 @@ def align_scene(scene_dir: Path, depths_dir: Path, repo_root: Path) -> dict:
             "med_scale": med_scale, "median_corr": float(np.median(correlations)) if correlations else 0.0}
 
 def write_depth_params(scene_dir: Path, params: dict):
+    """
+    Saves alignment parameters as a JSON file in the COLMAP sparse directory.
+    """
     out_path = scene_dir / "sparse" / "0" / "depth_params.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -299,10 +482,15 @@ def main():
     p.add_argument("--scenes",       nargs="+", default=ALL_SCENES)
     p.add_argument("--depths-dirname", type=str, default="depths_npy")
     p.add_argument("--model-size",   choices=["small", "base", "large"], default="large")
+    p.add_argument("--model-path",   type=Path, default=None,
+                   help="Local Hugging Face snapshot directory to load instead of --model-size repo id")
+    p.add_argument("--allow-download", action="store_true",
+                   help="Allow Transformers to download missing files; default is offline/local cache only")
     p.add_argument("--device",       type=str, default="cuda")
     p.add_argument("--overwrite",    action="store_true")
     p.add_argument("--skip-inference", action="store_true")
     p.add_argument("--invert-depth", action="store_true")
+    p.add_argument("--save-image",   action="store_true", help="Save visual colormapped depth map as a PNG image alongside the NPY file")
     args = p.parse_args()
 
     if not args.dataset_root.exists():
@@ -312,7 +500,13 @@ def main():
 
     model = None
     if not args.skip_inference:
-        model = DepthAnythingV2Wrapper(size=args.model_size, device=args.device, invert=args.invert_depth)
+        model = DepthAnythingV2Wrapper(
+            size=args.model_size,
+            device=args.device,
+            invert=args.invert_depth,
+            model_path=args.model_path,
+            local_files_only=not args.allow_download,
+        )
 
     summary = []
     for scene_name in args.scenes:
@@ -323,8 +517,8 @@ def main():
         depths_dir = scene_dir / args.depths_dirname
         print(f"\n── {scene_name} ──")
 
-        if not args.skip_inference:
-            run_inference_for_scene(scene_dir, depths_dir, model, args.overwrite)
+        if not args.skip_inference or args.save_image:
+            run_inference_for_scene(scene_dir, depths_dir, model, args.overwrite, save_image=args.save_image)
 
         align_result = align_scene(scene_dir, depths_dir, args.repo_root)
         out_path = write_depth_params(scene_dir, align_result["params"])

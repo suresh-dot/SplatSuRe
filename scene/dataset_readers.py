@@ -111,7 +111,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         image_path = os.path.join(images_folder, f"{extr.name[:-n_remove]}.{img_ext}")
         image_name = extr.name
-        depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
+        # Prefer .npy depth (real float data); fall back to .png for legacy 16-bit depth
+        depth_path = ""
+        if depths_folder != "":
+            depth_stem = extr.name[:-n_remove]
+            npy_candidate = os.path.join(depths_folder, f"{depth_stem}.npy")
+            png_candidate = os.path.join(depths_folder, f"{depth_stem}.png")
+            if os.path.exists(npy_candidate):
+                depth_path = npy_candidate
+            elif os.path.exists(png_candidate):
+                depth_path = png_candidate
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
@@ -376,7 +385,15 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             FovY = fovy 
             FovX = fovx
 
-            depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
+            # Prefer .npy depth (real float data); fall back to .png for legacy 16-bit depth
+            depth_path = ""
+            if depths_folder != "":
+                npy_candidate = os.path.join(depths_folder, f"{image_name}.npy")
+                png_candidate = os.path.join(depths_folder, f"{image_name}.png")
+                if os.path.exists(npy_candidate):
+                    depth_path = npy_candidate
+                elif os.path.exists(png_candidate):
+                    depth_path = png_candidate
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
                             image_path=image_path, image_name=image_name,
